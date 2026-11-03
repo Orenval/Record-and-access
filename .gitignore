@@ -32,6 +32,15 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+
+# test credentials & signin payloads
+signin-*.json
+evidence/signin-*.json
+evidence/*-cookies.txt
+
+# auth reference
+_auth_reference/
 
 # vercel
 .vercel
