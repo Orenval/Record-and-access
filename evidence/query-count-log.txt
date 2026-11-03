@@ -1,0 +1,197 @@
+===============================================================================
+REAL MEASUREMENT RUN: QUERY COUNT BENCHMARK
+Timestamp: 2026-11-03T19:53:34.623Z
+Environment: Next.js + PostgreSQL + Prisma ORM (with @prisma/adapter-pg)
+Alice User ID: cmvi771tc0000kktzhaqk7m2s (alice@test.bookmark)
+Bob User ID:   cmvi772dd0000nwtzavrrd76g (bob@test.bookmark)
+Methodology: Prisma query event listener (`db.$on('query')`) on live database.
+Counting Method: Real-time SQL statement capture categorized into Data Queries and Total Statements.
+===============================================================================
+
+===============================================================================
+1. LIST ACTION MEASUREMENTS (Empty [0], 1 row, 20 rows — N+1 Verification)
+===============================================================================
+
+--- [List Scenario A: Empty Account (0 bookmarks)] ---
+  [List (0 items) — Baseline (Run 1)]
+    Data queries: 2 | Tx control statements: 0 | Total: 2
+      1. [SELECT COUNT] Scoped count for empty-state check -> SQL: SELECT COUNT(*) AS "_count$_all" FROM (SELECT "public"."Bookmark"."id" FROM "public"."Bookmark" WHERE "public"."Bookmark"."userId" = $1 OFFSET $2) AS "sub"
+      2. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."publicId", "public"."Bookmark"."label", "public"."Bookmark"."url" FROM "public"."Bookmark" WHERE "public"."Bookmark"."userId" = $1 ORDER BY "public"."Bookmark"."createdAt" DESC OFFSET $2
+  [List (0 items) — Shipped (Run 1)]
+    Data queries: 1 | Tx control statements: 0 | Total: 1
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."publicId", "public"."Bookmark"."label", "public"."Bookmark"."url" FROM "public"."Bookmark" WHERE "public"."Bookmark"."userId" = $1 ORDER BY "public"."Bookmark"."createdAt" DESC OFFSET $2
+  >> 3-Run Stability Check (Baseline): [2, 2, 2] data queries
+  >> 3-Run Stability Check (Shipped):  [1, 1, 1] data queries
+
+--- [List Scenario B: Single Bookmark (1 item)] ---
+  [List (1 item) — Baseline (Run 1)]
+    Data queries: 2 | Tx control statements: 0 | Total: 2
+      1. [SELECT COUNT] Scoped count for empty-state check -> SQL: SELECT COUNT(*) AS "_count$_all" FROM (SELECT "public"."Bookmark"."id" FROM "public"."Bookmark" WHERE "public"."Bookmark"."userId" = $1 OFFSET $2) AS "sub"
+      2. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."publicId", "public"."Bookmark"."label", "public"."Bookmark"."url" FROM "public"."Bookmark" WHERE "public"."Bookmark"."userId" = $1 ORDER BY "public"."Bookmark"."createdAt" DESC OFFSET $2
+  [List (1 item) — Shipped (Run 1)]
+    Data queries: 1 | Tx control statements: 0 | Total: 1
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."publicId", "public"."Bookmark"."label", "public"."Bookmark"."url" FROM "public"."Bookmark" WHERE "public"."Bookmark"."userId" = $1 ORDER BY "public"."Bookmark"."createdAt" DESC OFFSET $2
+  >> 3-Run Stability Check (Baseline): [2, 2, 2] data queries
+  >> 3-Run Stability Check (Shipped):  [1, 1, 1] data queries
+
+--- [List Scenario C: Bulk Bookmarks (20 items)] ---
+  [List (20 items) — Baseline (Run 1)]
+    Data queries: 2 | Tx control statements: 0 | Total: 2
+      1. [SELECT COUNT] Scoped count for empty-state check -> SQL: SELECT COUNT(*) AS "_count$_all" FROM (SELECT "public"."Bookmark"."id" FROM "public"."Bookmark" WHERE "public"."Bookmark"."userId" = $1 OFFSET $2) AS "sub"
+      2. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."publicId", "public"."Bookmark"."label", "public"."Bookmark"."url" FROM "public"."Bookmark" WHERE "public"."Bookmark"."userId" = $1 ORDER BY "public"."Bookmark"."createdAt" DESC OFFSET $2
+  [List (20 items) — Shipped (Run 1)]
+    Data queries: 1 | Tx control statements: 0 | Total: 1
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."publicId", "public"."Bookmark"."label", "public"."Bookmark"."url" FROM "public"."Bookmark" WHERE "public"."Bookmark"."userId" = $1 ORDER BY "public"."Bookmark"."createdAt" DESC OFFSET $2
+  >> 3-Run Stability Check (Baseline): [2, 2, 2] data queries
+  >> 3-Run Stability Check (Shipped):  [1, 1, 1] data queries
+
+[N+1 Query Evaluation for List]:
+  Row count = 0:  Baseline = 2 data queries | Shipped = 1 data query
+  Row count = 1:  Baseline = 2 data queries | Shipped = 1 data query
+  Row count = 20: Baseline = 2 data queries | Shipped = 1 data query
+  Verification Result: Query count is strictly O(1) constant invariant (exactly 1 data query for shipped) across 0, 1, and 20 rows. Zero N+1 queries detected.
+
+===============================================================================
+2. DETAIL ACTION MEASUREMENTS (Owned vs Cross-User)
+===============================================================================
+
+--- [Detail Scenario A: Owned Bookmark (Alice accessing Alice's bookmark)] ---
+  [Detail Owned — Baseline 3Q (Run 1)]
+    Data queries: 3 | Tx control statements: 0 | Total: 3
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+      2. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+      3. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."publicId", "public"."Bookmark"."label", "public"."Bookmark"."url" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+  [Detail Owned — Baseline 2Q (Run 1)]
+    Data queries: 2 | Tx control statements: 0 | Total: 2
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+      2. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."publicId", "public"."Bookmark"."label", "public"."Bookmark"."url" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+  [Detail Owned — Shipped (Run 1)]
+    Data queries: 1 | Tx control statements: 0 | Total: 1
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."publicId", "public"."Bookmark"."label", "public"."Bookmark"."url" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+  >> Result returned: label="QC_LIVE_Alice_Target", publicId="XiIvh4n7cIAO"
+  >> 3-Run Stability Check (Baseline 3Q): [3, 3, 3] data queries
+  >> 3-Run Stability Check (Baseline 2Q): [2, 2, 2] data queries
+  >> 3-Run Stability Check (Shipped):     [1, 1, 1] data queries
+
+--- [Detail Scenario B: Cross-User Access Attempt (Bob accessing Alice's bookmark)] ---
+  [Detail Cross-User — Baseline 3Q (Run 1)]
+    Data queries: 1 | Tx control statements: 0 | Total: 1
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+  [Detail Cross-User — Baseline 2Q (Run 1)]
+    Data queries: 1 | Tx control statements: 0 | Total: 1
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+  [Detail Cross-User — Shipped (Run 1)]
+    Data queries: 1 | Tx control statements: 0 | Total: 1
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."publicId", "public"."Bookmark"."label", "public"."Bookmark"."url" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+  >> Result returned: null (Security contract enforced: row not returned)
+  >> 3-Run Stability Check (Baseline 3Q): [1, 1, 1] data queries
+  >> 3-Run Stability Check (Shipped):     [1, 1, 1] data queries
+  >> Access Control Note: Scoped lookup immediately evaluates to null on Query 1; short-circuits with zero information leak.
+
+===============================================================================
+3. DELETE ACTION MEASUREMENTS (Owned vs Cross-User, Audit & No-Audit)
+===============================================================================
+
+--- [Delete Scenario A: Owned Bookmark (Shipped path with Mandatory Audit)] ---
+  [Delete Owned (Shipped, Audit) Run 1]
+    Data queries: 3 | Tx control statements: 1 | Total: 4
+      1. [SELECT] Scoped label lookup for audit snapshot -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."label" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+      2. [INSERT] Audit row write with label snapshot -> SQL: INSERT INTO "public"."BookmarkDeletionAudit" ("id","userId","bookmarkPublicId","bookmarkLabel","deletedAt") VALUES ($1,$2,$3,$4,$5) RETURNING "public"."BookmarkDeletionAudit"."id", "public"."BookmarkDeletionAudit"."userId", "public"."BookmarkDeletionAudit"."bookmarkPublicId", "public"."BookmarkDeletionAudit"."bookmarkLabel", "public"."BookmarkDeletionAudit"."deletedAt"
+      3. [DELETE] Scoped Bookmark DELETE (publicId + userId) -> SQL: DELETE FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2)
+      4. [TX CONTROL] COMMIT
+  >> Result returned: label="QC_LIVE_Del_Shipped_1"
+  >> 3-Run Stability Check (Shipped Audit): [3, 3, 3] data queries (+1 tx control)
+
+--- [Delete Scenario B: Owned Bookmark (Baseline path with Mandatory Audit)] ---
+  [Delete Owned (Baseline, Audit) Run 1]
+    Data queries: 4 | Tx control statements: 1 | Total: 5
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+      2. [SELECT] Scoped label lookup for audit snapshot -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."label" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+      3. [INSERT] Audit row write with label snapshot -> SQL: INSERT INTO "public"."BookmarkDeletionAudit" ("id","userId","bookmarkPublicId","bookmarkLabel","deletedAt") VALUES ($1,$2,$3,$4,$5) RETURNING "public"."BookmarkDeletionAudit"."id", "public"."BookmarkDeletionAudit"."userId", "public"."BookmarkDeletionAudit"."bookmarkPublicId", "public"."BookmarkDeletionAudit"."bookmarkLabel", "public"."BookmarkDeletionAudit"."deletedAt"
+      4. [DELETE] Scoped Bookmark DELETE (publicId + userId) -> SQL: DELETE FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2)
+      5. [TX CONTROL] COMMIT
+  >> Result returned: label="QC_LIVE_Del_BaseAudit_1"
+  >> 3-Run Stability Check (Baseline Audit): [4, 4, 4] data queries (+1 tx control)
+
+--- [Delete Scenario C: Cross-User Delete Attempt (Bob attempting to delete Alice's bookmark)] ---
+  [Delete Cross-User (Shipped) Run 1]
+    Data queries: 1 | Tx control statements: 1 | Total: 2
+      1. [SELECT] Scoped label lookup for audit snapshot -> SQL: SELECT "public"."Bookmark"."id", "public"."Bookmark"."label" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+      2. [TX CONTROL] COMMIT
+  [Delete Cross-User (Baseline) Run 1]
+    Data queries: 1 | Tx control statements: 1 | Total: 2
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+      2. [TX CONTROL] COMMIT
+  >> Result returned: null (Security contract enforced: row not deleted, zero audit created)
+  >> 3-Run Stability Check (Cross-User Shipped):  [1, 1, 1] data query (+1 tx control)
+  >> 3-Run Stability Check (Cross-User Baseline): [1, 1, 1] data query (+1 tx control)
+
+--- [Delete Scenario D: Supplementary No-Audit Variant (PRD Section 10 Target: 2 -> 1)] ---
+  [Delete No-Audit (Baseline) Run 1]
+    Data queries: 2 | Tx control statements: 0 | Total: 2
+      1. [SELECT] Scoped Bookmark SELECT (publicId + userId) -> SQL: SELECT "public"."Bookmark"."id" FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2) LIMIT $3 OFFSET $4
+      2. [DELETE] Scoped Bookmark DELETE (publicId + userId) -> SQL: DELETE FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2)
+  [Delete No-Audit (Optimized) Run 1]
+    Data queries: 1 | Tx control statements: 0 | Total: 1
+      1. [DELETE] Scoped Bookmark DELETE (publicId + userId) -> SQL: DELETE FROM "public"."Bookmark" WHERE ("public"."Bookmark"."publicId" = $1 AND "public"."Bookmark"."userId" = $2)
+  >> 3-Run Stability Check (No-Audit Baseline):  [2, 2, 2] data queries
+  >> 3-Run Stability Check (No-Audit Optimized): [1, 1, 1] data query
+
+===============================================================================
+4. SESSION VALIDATION OVERHEAD (Shared Auth Overhead)
+===============================================================================
+  [Session Validation Simulation (Run 1)]
+    Data queries: 3 | Tx control statements: 0 | Total: 3
+      1. [SELECT] Session lookup by token hash -> SQL: SELECT "public"."Session"."id", "public"."Session"."userId", "public"."Session"."sessionTokenHash", "public"."Session"."createdAt", "public"."Session"."lastActivityAt", "public"."Session"."expiresAt", "public"."Session"."invalidatedAt" FROM "public"."Session" WHERE ("public"."Session"."sessionTokenHash" = $1 AND 1=1) LIMIT $2 OFFSET $3
+      2. [SELECT] User lookup by session userId relation -> SQL: SELECT "public"."User"."id", "public"."User"."fullName", "public"."User"."email" FROM "public"."User" WHERE "public"."User"."id" = $1 OFFSET $2
+      3. [UPDATE] Update Session lastActivityAt (touch) -> SQL: UPDATE "public"."Session" SET "lastActivityAt" = $1 WHERE ("public"."Session"."id" = $2 AND 1=1) RETURNING "public"."Session"."id", "public"."Session"."userId", "public"."Session"."sessionTokenHash", "public"."Session"."createdAt", "public"."Session"."lastActivityAt", "public"."Session"."expiresAt", "public"."Session"."invalidatedAt"
+  >> 3-Run Stability Check (Session Validation): [3, 3, 3] data queries
+  >> Overhead Breakdown: 3 data queries (1. SELECT Session, 2. SELECT User relation, 3. UPDATE Session lastActivityAt)
+  >> Accounting Note: Shared auth infrastructure overhead, verified on every authenticated request, excluded from domain bookmark action numbers.
+
+===============================================================================
+5. MASTER MEASURED QUERY-COUNT SUMMARY TABLE
+===============================================================================
+| Action | Before (queries) | After (queries) | What changed |
+|---|---|---|---|
+| List | 2 | 1 | Removed redundant COUNT(*) query for empty check; UI uses array length. |
+| View detail (3Q baseline) | 3 | 1 | Existence, ownership, and fetch consolidated into a single scoped findFirst. |
+| View detail (2Q baseline) | 2 | 1 | Existence check and fetch consolidated into a single scoped findFirst. |
+| Delete (shipped with audit) | 4 (total: 5) | 3 (total: 4) | Eliminated redundant pre-existence check; scoped findFirst reads label directly. |
+| Delete (no audit, PRD target) | 2 | 1 | Consolidated fetch-then-delete into a single scoped deleteMany (audit omitted). |
+
+===============================================================================
+6. QUERY CLASSIFICATION AND PURPOSE AUDIT
+===============================================================================
+
+--- LIST ACTION ---
+[Before - 2 Queries]:
+  Query 1: SELECT COUNT -> Scoped count for empty-state check [Redundant; list length satisfies empty check]
+  Query 2: SELECT -> Scoped Bookmark SELECT (publicId + userId) [Primary data lookup]
+[After - 1 Query]:
+  Query 1: SELECT -> Scoped Bookmark SELECT (publicId + userId) [Primary data lookup]
+
+--- VIEW DETAIL ACTION ---
+[Before (3Q) - 3 Queries]:
+  Query 1: SELECT -> Scoped Bookmark SELECT (publicId + userId) [Primary data lookup]
+  Query 2: SELECT -> Scoped Bookmark SELECT (publicId + userId) [Primary data lookup]
+  Query 3: SELECT -> Scoped Bookmark SELECT (publicId + userId) [Primary data lookup]
+[After - 1 Query]:
+  Query 1: SELECT -> Scoped Bookmark SELECT (publicId + userId) [Primary data lookup]
+
+--- DELETE ACTION (Shipped, Audit Enforced) ---
+[Before - 4 Data Queries + 1 Tx Control]:
+  Statement 1: [SELECT] Scoped Bookmark SELECT (publicId + userId) [Primary data lookup]
+  Statement 2: [SELECT] Scoped label lookup for audit snapshot [Needed to snapshot label for audit log]
+  Statement 3: [INSERT] Audit row write with label snapshot [Required by security spec before deletion]
+  Statement 4: [DELETE] Scoped Bookmark DELETE (publicId + userId) [Primary deletion]
+  Statement 5: [TX CONTROL] COMMIT -> Transaction boundary demarcation
+[After - 3 Data Queries + 1 Tx Control]:
+  Statement 1: [SELECT] Scoped label lookup for audit snapshot [Needed to snapshot label for audit log]
+  Statement 2: [INSERT] Audit row write with label snapshot [Required by security spec before deletion]
+  Statement 3: [DELETE] Scoped Bookmark DELETE (publicId + userId) [Primary deletion]
+  Statement 4: [TX CONTROL] COMMIT -> Transaction boundary demarcation
+
+===============================================================================
+END OF BENCHMARK RUN: ALL MEASUREMENTS COMPLETED SUCCESSFULLY
+===============================================================================
