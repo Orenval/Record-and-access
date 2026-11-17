@@ -1,496 +1,770 @@
-# Documentation
+# Bookmarks: Records and Access Slice
 
-This file is the project handoff. This entry covers **Section 5 — the Records
-and Access slice**, matching `docs/Records_Access_PRD.md` Section 14. It records
-what was built, how it is protected, what it costs, and where the limits are,
-with the evidence gathered while building and testing it.
+## Section 1: What This Is
 
-## 5. Records and Access Slice
+This slice is a small bookmarks app where a signed-in user can create, list,
+view, and delete their own bookmarks. A bookmark is just a label and a URL. The
+record type does not matter much here. What matters is that no user can ever
+reach another user's bookmarks, whether they click around the screens, edit an
+identifier in the address bar, or call the API directly with a tool like curl.
+To make that true, every database query that touches a bookmark includes the id
+of the signed-in user, every deletion writes an audit record before the
+bookmark disappears, and the URLs only ever contain a random public identifier,
+never the real database id.
 
-A signed-in user can create, list, view, and delete their own bookmarks
-(`label` + `url`). There is no sharing, no public access, and no cross-user
-visibility of any kind.
-
-### 5.1 The four questions
-
-**Q1 — What was built, and why this shape?**
-A bookmark slice on top of the existing authentication system: two tables
-(`Bookmark`, `BookmarkDeletionAudit`), one data-access module
-(`src/lib/bookmarks.ts`), two API routes (`/api/bookmarks`,
-`/api/bookmarks/[publicId]`), and two real pages (`/bookmarks`,
-`/bookmarks/[publicId]`). Ownership is carried by `userId` taken only from the
-validated session; every query that touches a bookmark row includes that
-`userId` in its own `WHERE` clause.
-
-**Q2 — How is it protected?**
-Session-derived identity, a single scoped data-access module, explicit column
-allowlists, uniform 404s for ownership misses, session-bound CSRF on mutations,
-server-side Zod validation (including an `http`/`https` allowlist and rejection
-of embedded credentials), and an audit row written inside the same transaction
-that performs the delete.
-
-**Q3 — What does it cost?**
-Two indexes on `Bookmark` plus its unique `publicId` index, one index on
-`BookmarkDeletionAudit`, and at most one bookmark query per action except
-delete, which needs three statements to keep the audit guarantee. Measured
-before/after: list 2 -> 1, detail 3 -> 1, delete with audit 4 -> 3 (2 -> 1
-without audit). `validateSession()` adds two auth queries per HTTP request and
-is deliberately excluded from those numbers and disclosed with them.
-
-**Q4 — What are the limits?**
-This is a slice, not an authorization framework. There is no sharing model, no
-pagination, no update operation, and the audit trail covers deletions only. The
-audit table is not tamper-evident, and a compromised application process could
-still write false audit rows. Reasonable next steps are server-side pagination,
-a shared end-to-end test suite, and rate limiting on creation.
+I deliberately left out anything the assignment did not ask for. There is no
+editing, search, tags, sharing, or collaboration, no landing page, and no
+dashboard widgets. The only screens are the list, the create form, the detail
+view, and the delete confirmation. Sign in and session checking were reused from
+an authentication project I built earlier, but only those two parts. I did not
+bring over sign up, email verification, or password reset, since this slice only
+needs to know who is making each request. Because there is no sign up page, the
+test accounts are created with a script.
 
 ---
 
-### 5.2 Authentication versus authorization
+## Section 2: How To Run It
 
-**What/why.** Authentication answers "who is making this request" and is handled
-by the existing session cookie plus `validateSession()`. Authorization answers
-"may this identity touch this row" and is handled by `userId` scoping in
-`src/lib/bookmarks.ts`. They are separate steps with separate failure codes:
-no identity is `401`, an identity without access to the row is `404`.
+1. **Install dependencies:** `npm install`. A `postinstall` script
+   (`scripts/fix-cmd-shims.js`) runs automatically. It only matters on Windows
+   when the project folder name contains an ampersand, and it is explained in
+   Section 6.
+2. **Copy the env file and fill in the values:** `cp .env.example .env`. Two
+   variables are needed, listed below.
+3. **Create the PostgreSQL database** named in `DATABASE_URL`. Nothing creates it
+   for you, so it has to exist before the next step.
+4. **Run the migrations:** `npx prisma migrate dev`. This creates every table,
+   index, and foreign key described in Section 4, and generates the Prisma
+   client.
+5. **Create two test users.** There is no sign up page, so run this once for each
+   account:
+   `node scripts/create-user.js <email> <password>`
+   The evidence in this document uses `alice@test.bookmark` and
+   `bob@test.bookmark`.
+6. **Start the app:** `npm run dev`.
+7. **Open it:** go to `http://localhost:3000`, sign in at `/signin`, and you land
+   on `/bookmarks`.
 
-**Security.** `userId` is read only from `sessionData.session.userId`. It is
-never read from the request body, query string, or URL. A create request that
-supplies `userId`, `publicId`, or `id` in its JSON body is parsed by the Zod
-schema, which strips unknown keys; the live test proved the forged identifiers
-were ignored and the row was owned by the signed-in user.
+**Environment variables and where each one comes from:**
 
-**Cost.** One session lookup pair per request (session SELECT plus
-`lastActivityAt` update), already part of the auth system, plus the bookmark
-query itself. No extra authorization round trip.
+```env
+# A PostgreSQL connection string for your own local database.
+# The database must already exist (step 3).
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/records_access"
 
-**Tradeoff.** Keeping authorization inside the data-access module means routes
-stay thin, but it also means any future bookmark read/write must go through that
-module. That is intentional: there is exactly one place to audit.
+# A random secret used to sign the CSRF tokens. Generate one with:
+# node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+CSRF_SECRET="replace-with-64-hex-char-random-string"
+```
 
----
+There is no `SESSION_SECRET`. Sessions here are random tokens, and the database
+stores only a hash of each token, so nothing needs to be signed. I explain this
+in Section 6.
 
-### 5.3 Scoping the query versus checking after the fetch
+**Reproducing the evidence (optional).** With the dev server running, these
+scripts reproduce the evidence in this document. Each run creates its own test
+rows and deletes them afterward.
 
-**What/why.** The insecure pattern is: fetch a row by identifier, then compare
-its owner in application code. The pattern here is: put the owner in the same
-`WHERE` clause that fetches the row, so a row owned by someone else is never
-returned at all. Every function in `src/lib/bookmarks.ts` takes `userId` as a
-required first argument.
-
-**Security.** This removes the fetch-then-compare class of bug entirely. There
-is no branch in which an unauthorized row is loaded into memory and then
-filtered; there is no temporary state in which the check can be skipped, and no
-time-of-check/time-of-use gap between reading ownership and acting on it. The
-delete path uses a scoped `deleteMany`, not `delete`, so the ownership
-condition is part of the deletion statement itself.
-
-**Cost.** One query per action instead of two or three. The ownership condition
-uses the `(userId, createdAt)` index for lists and the unique `publicId` index
-for single-row lookups.
-
-**Tradeoff.** Scoped queries make "row exists but is not yours" and "row does
-not exist" indistinguishable at the data layer. That is the desired behavior,
-but it means the application cannot produce a distinct `403` for another user's
-row even if a product requirement later asks for one.
-
----
-
-### 5.4 Insecure direct object references (IDOR)
-
-**What/why.** The detail and delete routes accept a client-controlled
-identifier in the URL (`/bookmarks/[publicId]`). IDOR is the failure mode where
-changing that identifier reaches another user's record. Here, the identifier is
-always combined with the session's `userId` before any row is read or deleted.
-
-**Security.** The full attack table is in 5.11. Every route was attacked as Bob
-against Alice's real bookmark, both through the UI URL and by calling the API
-directly with `curl`, including replaying Bob's session with Alice's identifier.
-Every attempt returned `404`, no row was deleted, and the missing-row response
-was byte-identical to the other-user response. The raw internal database `id`
-was also rejected (`404`) when used where a `publicId` belongs.
-
-**Cost.** No additional query. The identifier and the owner travel in the same
-`WHERE` clause.
-
-**Tradeoff.** A uniform `404` makes support and debugging slightly harder
-because logs cannot distinguish "missing" from "not yours" without joining the
-audit or ownership data. That ambiguity is the security property, not a bug.
+```bash
+node scripts/run-attacks.mjs                    # the access control attacks
+node scripts/verify-bookmark-security.mjs       # the full 26 assertion harness
+node scripts/measure-query-counts.mjs           # the query counts
+node scripts/test-bookmark-delete-rollback.mjs  # the audit rollback tests
+```
 
 ---
 
-### 5.5 Why raw database identifiers are not exposed
+## Section 3: The Flow, Step By Step
 
-**What/why.** `Bookmark.id` is an internal `cuid` used for joins and referential
-integrity. Clients only ever see `publicId`, a 12-character `nanoid` with a
-unique index. Every read uses an explicit `select` allowlist
-(`publicId`, `label`, `url`), so the internal `id` and the owning `userId`
-cannot leak through an accidental `select *` or a serialized model.
+Here is what happens from a user's first action to the last, following the real
+routes and files.
 
-**Security.** Hiding the internal identifier removes a stable, enumerable handle
-and keeps the public surface independent of the primary key. The detail page
-test confirmed the internal id does not appear in the rendered HTML while the
-`publicId` does. Crucially, `publicId` is **not** a secret and is not treated as
-one: the authorization decision is still `publicId + userId`, so leaking a
-`publicId` does not grant access.
+**1. Sign in.** The user opens `/signin` and submits their email and password.
+The page sends them to `POST /api/auth/signin`. The server checks the password
+against the stored hash, creates a session, and sets a cookie. The cookie holds
+a random token and is `HttpOnly` and `SameSite=Strict`. Only a hash of the token
+is stored in the `Session` table. On success the page sends the user to
+`/bookmarks`.
 
-**Cost.** One extra unique index and a generated value per row. No extra query.
+**2. Open the list.** The user lands on `/bookmarks`
+(`src/app/bookmarks/page.tsx`). This is a server component, so it runs on the
+server before anything is sent to the browser. It calls `validateSession()`
+first. If there is no valid session it redirects to `/signin` and never touches
+bookmark data. `src/proxy.ts` also guards `/bookmarks` and `/dashboard`, and an
+unauthenticated visit gets a `307` redirect to `/signin`. With a valid session,
+the page calls the list function in `src/lib/bookmarks.ts`, passing the `userId`
+taken from the session. The query returns only that user's bookmarks, newest
+first. If there are none, the user sees a real empty state with no placeholder
+content. (`/dashboard` is a leftover from the ported auth and only redirects to
+`/bookmarks`.)
 
-**Tradeoff.** `publicId` adds a second identifier to reason about, and any future
-join that needs the internal id must happen server-side. That is a small price
-for not shipping primary keys to the browser.
+**3. Create a bookmark.** The user fills in a label and a URL and submits. The
+frontend sends `POST /api/bookmarks` with the data and a CSRF token. The route
+works through its checks in a fixed order: no session gives `401`, a bad CSRF
+token gives `403`, invalid input gives `400`, and only then does it touch the
+database. Validation is a Zod schema on the server. It allows only `http` and
+`https` URLs, rejects URLs with credentials embedded in them, and strips any
+field it does not recognize. The create function in `src/lib/bookmarks.ts` sets
+the owner from the session and generates a new random `publicId`. The response
+is `201` and contains only `label`, `publicId`, and `url`.
 
----
+**4. View one bookmark.** The user clicks a bookmark and goes to
+`/bookmarks/[publicId]`. That page also checks the session first, then calls
+`getBookmark(userId, publicId)`. Both values sit in the same `WHERE` clause. If
+the query finds nothing, the page calls `notFound()`. The user sees a normal
+404 page whether the bookmark does not exist or belongs to someone else.
 
-### 5.6 Audit logging
+**5. Delete a bookmark.** From the detail page the user presses delete and
+confirms. The frontend sends `DELETE /api/bookmarks/[publicId]` with the CSRF
+token. After the same session and CSRF checks, the server opens one database
+transaction. Inside it, it reads the bookmark's label (scoped to the user),
+inserts a row into `BookmarkDeletionAudit`, and then runs a scoped
+`deleteMany`. If any step fails, the whole transaction rolls back. If the delete
+removes zero rows, the code throws `BookmarkDisappearedError`, which also rolls
+back, so no audit row is left behind, and the user gets a `404`. On success the
+user is back on the list and the bookmark is gone.
 
-**What/why.** Deleting a bookmark writes a `BookmarkDeletionAudit` row capturing
-`userId`, `bookmarkPublicId`, a snapshot of `bookmarkLabel`, and `deletedAt`.
-The row is written **before** the delete, inside the same interactive
-transaction, so the audit trail cannot silently miss a successful deletion.
-
-**Security.** If the audit insert fails, the transaction rolls back and the
-bookmark is not deleted. If a concurrent delete removes the row between the
-scoped lookup and the scoped `deleteMany`, the zero-row result throws
-`BookmarkDisappearedError`, which rolls the transaction back so no orphan audit
-row is left, and the API returns `404`. The live test produced exactly one audit
-row for Alice's successful deletion, matching her `userId`, the deleted
-`publicId`, and the label snapshot. Both failure paths are exercised directly
-by `scripts/test-bookmark-delete-rollback.mjs`: an injected audit-insert failure
-leaves the bookmark in place with no audit row, and a delete that loses a race
-returns `null` with no orphan audit row.
-
-**Cost.** One `INSERT` and one transaction on delete: the shipped delete is
-three bookmark-work statements (scoped lookup, audit insert, scoped delete)
-instead of two. This is the reason the delete target in PRD Section 10 (2 -> 1)
-is not reachable without dropping the audit requirement; see 5.10.
-
-**Tradeoff.** The audit is deletion-only and is not cryptographically chained,
-so it is an operational record, not tamper-evident proof. Extending it to reads
-or updates would multiply write volume and was outside this slice.
-
----
-
-### 5.7 Page architecture and URL state
-
-**What/why.** The list lives at `/bookmarks` and each bookmark has its own real
-URL at `/bookmarks/[publicId]`. Both are server components that render on the
-server and use normal links, so a detail view can be reloaded, bookmarked, or
-shared and still lands on the right record (or a `404` if the viewer is not the
-owner). There is no modal-only or client-state-only view.
-
-**Security.** Both pages call `validateSession()` and `redirect("/signin")`
-before any data access, so an unauthenticated request never renders bookmark
-content. The detail page calls `notFound()` when the scoped lookup returns
-nothing, which renders the standard 404 page. Because the page and the API share
-`getBookmark`, the page cannot drift into a different ownership rule.
-
-**Cost.** One page render and one scoped query per view. The `publicId` in the
-URL is the same value the API uses, so no extra translation step is needed.
-
-**Tradeoff.** Server-rendered navigation is a full document request rather than
-a client-side transition. For a list/detail slice this is simpler and keeps the
-URL authoritative; a heavier app might add prefetching or a client cache later.
+If you know this flow, you can predict where any behavior lives. Anything about
+who is asking is in the session code. Anything about which rows can be touched
+is in `src/lib/bookmarks.ts`. Everything else is a thin route or page that calls
+into those two.
 
 ---
 
-### 5.8 Status codes (401 versus 403, and 404 for ownership misses)
+## Section 4: The Data Model
 
-Check order is uniform across the bookmark API:
-**401 (no session) -> 403 (CSRF failure) -> 400 (validation) -> data access
-(404 or success).**
+These are the tables this slice uses. Two are new (`Bookmark` and
+`BookmarkDeletionAudit`) and three came with the ported sign in. The schema is
+in `prisma/schema.prisma`, and the database is built by three forward-only
+migrations: the initial one, `add_bookmarks`, and `reconcile_auth_schema`.
 
-| Status | When it is returned | Body | Why not the alternative |
-|---|---|---|---|
-| 401 | No valid session, on any bookmark page or API route | `{"success":false,"message":"Not authenticated"}` | Authentication failure is a distinct condition. Returning 404 would hide a fixable client problem without gaining any secrecy. |
-| 403 | Valid session, mutating request (POST/DELETE), missing or wrong CSRF token | `{"success":false,"message":"Invalid CSRF token"}` | This is not an ownership answer. It is a request-integrity refusal and is decided before any row lookup, so it reveals nothing about the identifier. |
-| 404 | The scoped query returned no row: the bookmark is missing **or** belongs to another user | `{"success":false,"message":"Bookmark not found"}`, byte-identical in both cases | A 403 here would confirm that the identifier exists but is not yours, which is an enumeration oracle. A uniform 404 denies that signal. |
-| 400 | Malformed JSON, or a label/URL that fails validation | `{"success":false,"message":"Invalid request body"}` or `{"success":false,"message":"Validation failed","errors":{...}}` | Validation is a client error, not an authorization decision; it is checked only after identity and CSRF. |
-| 201 / 200 | Create succeeded / list, detail, or delete succeeded | `{success, message, data}` (create and list) or `{success, message}` (delete) | Normal success paths. |
-| 307 | Unauthenticated request to `/bookmarks` or `/bookmarks/[publicId]` | Redirect to `/signin` | Pages redirect; APIs return 401. The distinction keeps browser behavior usable without weakening the API contract. |
+### `User`
+```prisma
+model User {
+  id           String   @id @default(cuid())
+  fullName     String
+  email        String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
-The live tests confirm the ordering: a no-session `DELETE` with no CSRF token
-returns `401`, not `403`; Bob's `DELETE` with a valid session and no CSRF token
-returns `403`, not `404`; Bob's `DELETE` with a valid CSRF token returns `404`.
-An Alice-session request carrying Bob's CSRF token also returns `403`, which
-shows the token is validated against the session rather than merely present.
+  sessions               Session[]
+  bookmarks              Bookmark[]
+  bookmarkDeletionAudits BookmarkDeletionAudit[]
+}
+```
+The account record. Email is unique so two accounts cannot share an address, and
+the password is only ever stored as a hash.
+
+### `Session`
+```prisma
+model Session {
+  id               String    @id @default(cuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionTokenHash String    @unique
+  createdAt        DateTime  @default(now())
+  lastActivityAt   DateTime  @default(now())
+  expiresAt        DateTime
+  invalidatedAt    DateTime?
+
+  @@index([userId])
+}
+```
+One row per signed-in session. The token is stored as a hash, so a leaked
+database does not hand out usable session cookies. The hash is unique so a
+cookie always matches at most one session.
+
+### `RateLimitAttempt`
+```prisma
+model RateLimitAttempt {
+  id           String    @id @default(cuid())
+  identifier   String
+  route        String
+  attemptCount Int       @default(1)
+  lockedUntil  DateTime?
+  windowStart  DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([identifier, route])
+}
+```
+Used by the sign in rate limiter that came with the ported auth. The unique pair
+means one counter per person per route.
+
+### `Bookmark`
+```prisma
+model Bookmark {
+  id        String   @id @default(cuid())
+  publicId  String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  label     String
+  url       String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([userId, createdAt])
+}
+```
+Holds the bookmarks. Each one belongs to exactly one user.
+
+- **`id` and `publicId` are two separate columns on purpose.** `id` is the real
+  primary key and never leaves the server. `publicId` is a random 12 character
+  nanoid and is the only identifier that appears in URLs or API responses. I
+  explain why in Section 5.
+- **`publicId` is unique.** This guarantees two bookmarks can never share a
+  public identifier, so a lookup by `publicId` and `userId` can match at most
+  one row.
+- **`userId` is required.** A bookmark cannot exist without an owner, and the
+  foreign key means it cannot point at a user that does not exist. The cascade
+  means removing a user also removes their bookmarks.
+- **`label` and `url` are plain text.** The rules about what a URL may look like
+  (only `http` and `https`, no embedded credentials) are enforced by the Zod
+  schema in the application, not by the database.
+- **The two indexes** match the real queries and are explained in Section 5.
+
+### `BookmarkDeletionAudit`
+```prisma
+model BookmarkDeletionAudit {
+  id               String   @id @default(cuid())
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bookmarkPublicId String
+  bookmarkLabel    String
+  deletedAt        DateTime @default(now())
+
+  @@index([userId])
+}
+```
+One row for every deleted bookmark, recording who deleted it, which bookmark it
+was, and when.
+
+- **It stores a copy of the label (`bookmarkLabel`) and the `publicId` as plain
+  text, not a foreign key to `Bookmark`.** The bookmark row is gone after the
+  delete, so a link to it would point at nothing. A copy of the label is the
+  only way the audit row can still say what was deleted.
+- **`deletedAt` defaults to the current time**, so the timestamp is set by the
+  database at the moment the row is written.
+
+### Which constraints make an invalid state impossible?
+
+- `User.email` is unique, so two accounts cannot share an email.
+- `Bookmark.publicId` is unique, so one public identifier can never lead to two
+  different bookmarks.
+- `Bookmark.userId` is required and is a foreign key, so a bookmark can never
+  exist without a real owner. The same is true of `Session` and
+  `BookmarkDeletionAudit`, so none of them can point at a user that does not
+  exist.
+- `Session.sessionTokenHash` is unique, so a session cookie can match only one
+  session.
+
+The only constraints I added for this slice are these indexes and foreign keys.
+There are no CHECK constraints. I want to be clear about what the database does
+**not** guarantee, because it matters more here than anywhere else:
+
+- The database does not know who owns a row in the sense of who is asking. If a
+  query forgot the `userId` condition, Postgres would happily return someone
+  else's bookmark. The whole protection lives in application code, in one
+  module, which is the reason I structured it that way (Section 5).
+- The database does not stop an audit row from being edited or deleted later.
+  It stays an honest record only because my code never does that.
+- The order "audit first, then delete" is enforced by a transaction in the code,
+  not by the schema.
 
 ---
 
-### 5.9 Database indexing
+## Section 5: The Concepts
 
-All indexes below were verified against the live database with
-`prisma migrate diff` and `pg_indexes`.
+### Authentication versus authorisation
 
-| Index | Purpose |
-|---|---|
-| `Bookmark_publicId_key` (unique) | Detail and delete lookups by `publicId`; also enforces uniqueness of the public identifier. |
-| `Bookmark_userId_idx` | Every list, lookup, and delete filters by the session's `userId` first. |
-| `Bookmark_userId_createdAt_idx` | The list is `WHERE userId = ? ORDER BY createdAt DESC`; this index serves the filter and the sort. |
-| `BookmarkDeletionAudit_userId_idx` | Supports per-user audit history queries and cascade behavior. |
-| `Bookmark.userId -> User.id` (cascade) | Deleting a user removes their bookmarks. |
-| `BookmarkDeletionAudit.userId -> User.id` (cascade) | Deleting a user removes their audit rows. |
+**What it is.** Authentication answers "who is making this request?" Authorisation
+answers "is this person allowed to touch this specific thing?" They are two
+different questions, and passing the first does not mean passing the second.
 
-**What/why.** The composite index matches the exact shape of the list query, so
-the database can satisfy both the filter and the ordering without a separate
-sort step. The unique index makes the public identifier both fast and
-collision-free.
+**Why it is needed.** If an app only checks that someone is signed in, then any
+signed-in user can read or delete any other user's data, as long as they can
+guess an identifier. Being logged in proves who you are. It says nothing about
+which rows are yours.
 
-**Cost.** Write amplification on insert/update and storage for four indexes.
-For a bookmark-sized workload this is negligible.
+**How I implemented it.** Authentication is the ported session system. The
+cookie holds a random token, the database holds only a hash of it, and
+`validateSession()` (in `src/lib/session.ts`) looks the hash up on every
+request. A session expires after 30 minutes of inactivity or 24 hours in total.
+Authorisation is a separate step done by `userId` scoping in
+`src/lib/bookmarks.ts`. The `userId` is read only from the validated session. It
+is never read from the request body, the query string, or the URL. I proved this
+with a forged create request that included someone else's `userId`, a `publicId`,
+and an `id` in the body. The Zod schema stripped all three, and the new bookmark
+was owned by the signed-in user.
 
-**Tradeoff.** There is no index for searching inside labels or URLs; this slice
-does not offer search. Adding one later should be driven by a real query shape,
-not added speculatively.
+**What I chose against, and why.** I did not scatter ownership checks across
+each route handler. Keeping authorisation inside one data-access module means the
+routes stay thin, and there is exactly one place to audit. The trade-off is that
+every future read or write of a bookmark has to go through that module.
 
----
+### Scoping the query versus checking after the fetch
 
-### 5.10 Query count as a cost (before and after)
+**What it is.** There are two ways to protect a row. The risky way is to fetch it
+by identifier, then compare its owner to the current user in code. The safe way
+is to put the owner in the same `WHERE` clause that fetches the row, so a row
+that belongs to someone else is never returned in the first place.
 
-Measured with Prisma query events on a client constructed with query logging
-(`scripts/measure-bookmark-queries.mjs`, measurement-only and never imported by
-the application). Transaction control statements (`BEGIN`/`COMMIT`) are shown
-separately and excluded. The "before" functions are deliberately redundant but
-still include `userId` in every `WHERE` clause, so the harness never exercises a
-fetch-then-compare path.
+**Why it is needed.** The fetch-then-compare version works today and fails the
+day someone writes a new route and forgets the comparison. Between loading the
+row and checking it, the other user's data is already in memory. A scoped query
+removes that whole class of mistake. There is no code path that can return
+another user's row, so there is no check to forget.
 
-| Action | Before | After | What changed |
-|---|---|---|---|
-| List | 2 | 1 | Removed a separate `COUNT` used only for the empty state; the page checks the length of the single result set instead. |
-| View detail | 3 | 1 | Existence, ownership, and the row data are answered by one scoped `findFirst`; the two extra lookups are gone. |
-| Delete (audit included, shipped) | 4 | 3 | Removed a redundant second ownership lookup; the remaining statements are one scoped label lookup, the audit insert, and one scoped `deleteMany`. |
-| Delete (no audit, PRD Section 10 target) | 2 | 1 | A single scoped `deleteMany` replaces lookup-then-delete. Shown for completeness; this variant is **not** shipped because it would drop the audit guarantee. |
+**How I implemented it.** Every function in `src/lib/bookmarks.ts` takes
+`userId` as a required first argument, and every query includes it:
 
-Per-query classification (shipped path):
+```ts
+const bookmark = await prisma.bookmark.findFirst({
+  where: { publicId, userId },
+  select: { publicId: true, label: true, url: true },
+});
+```
 
-- List: 1 x scoped `Bookmark` SELECT (`userId` filter, `createdAt` order).
-- Detail: 1 x scoped `Bookmark` SELECT (`publicId` + `userId`).
-- Delete: 1 x scoped `Bookmark` SELECT (label only) -> 1 x `BookmarkDeletionAudit` INSERT (label snapshot) -> 1 x scoped `Bookmark` DELETE (`publicId` + `userId`), plus one transaction-control statement.
+Delete uses a scoped `deleteMany` instead of `delete`, because `delete` only
+accepts a unique key and cannot carry the ownership condition in the same
+statement. All bookmark database access lives in that one module, and no route
+or page calls Prisma for bookmarks directly.
 
-**The single change that reduced the most queries** was combining existence,
-ownership, and fetch for the detail view: 3 -> 1, removing two round trips. It
-wins because all three questions are answered by the same `WHERE` clause, so the
-extra queries were pure redundancy rather than necessary stages.
+**What I chose against, and why.** I rejected the fetch-then-compare pattern. I
+also considered Postgres row level security, which would push the same rule into
+the database itself and is a stronger guarantee. I did not use it because it
+needs per-request database settings that are awkward with Prisma, and it went
+beyond what this slice asked for. One side effect of scoping is that "row does
+not exist" and "row is not yours" look identical to the data layer, so I cannot
+return a different answer for each. That is what I want, as the status codes
+section below explains.
 
-**Deviation from PRD Section 10.** The PRD's delete row says 2 -> 1, but the
-PRD also requires an audit row written before deletion (Section 7). Keeping that
-guarantee makes the floor three statements, not one. The shipped implementation
-therefore records 4 -> 3 and does not weaken the audit or scoping requirement to
-match a number. The 2 -> 1 figure is evidenced by the explicitly labeled
-no-audit variant above.
+### Insecure direct object references (IDOR)
 
-**Excluded from these counts:** `validateSession()` costs two queries per HTTP
-request (session SELECT plus `lastActivityAt` update). That is authentication
-overhead shared by every route, not bookmark work, and it is disclosed here so
-the numbers are not mistaken for total request cost.
+**What it is.** An IDOR happens when an app trusts an identifier from the client,
+such as the one in the URL, and uses it to load a record without checking that
+the person asking is allowed to see it. Change the number or string in the URL,
+and you reach someone else's data.
 
-**Verification:** `scripts/test-bookmark-delete-rollback.mjs` passes 3/3
-(audit-failure rollback, concurrent-delete rollback, normal path). The final
-production build (`npm run build` -> `npm run start`) serves the same routes and
-passes the same access-control harness as `next dev`.
+**Why it is needed.** The detail and delete routes take an identifier straight
+from the URL (`/bookmarks/[publicId]`). Without protection, anyone who learns
+or guesses another user's `publicId` could open or delete that bookmark. Hiding
+the identifier would not fix this. The protection has to be the ownership check.
 
----
-
-### 5.11 Attack audit table
-
-Two real accounts are used (`alice@test.bookmark`, `bob@test.bookmark`). Alice
-creates a bookmark first; every attempt below is made against that real row
-unless stated otherwise. `scripts/verify-bookmark-security.mjs` reproduces the
-table and passes 26/26 assertions against both `next dev` and the production
-`next start` build (the 24 attack checks below, one audit-row assertion, and one
-session-setup check). The database is restored to baseline after every run
-(`User=2, Session=0, RateLimitAttempt=0, Bookmark=0,
-BookmarkDeletionAudit=0`).
+**How I implemented it.** The identifier is never used alone. It is always
+combined with the session's `userId` in the same query (previous concept). To
+prove it, I created Alice and Bob and attacked every route as Bob against
+Alice's real bookmark. I edited the URL, replayed Bob's session against Alice's
+identifier, and called the API directly with curl. I also checked that sending
+the internal database `id` where a `publicId` belongs returns `404`. The exact
+commands and raw output are in `evidence/attack-log.txt`. The table below comes
+from the full test harness, which passes all 26 assertions against both
+`next dev` and the production build.
 
 | # | Method | Path | Attempted | Result | Pass |
 |---|---|---|---|---|---|
 | 1 | GET | `/bookmarks` (page) | Open the list with no session | `307` to `/signin` | Pass |
-| 2 | GET | `/bookmarks` (page) | List while signed in as Bob, with Alice's row present | `200`; Alice's label and `publicId` absent | Pass |
-| 3 | GET | `/bookmarks/[alice-publicId]` (page) | Edit the URL to Alice's identifier while signed in as Bob | `404`; no label or URL leaked | Pass |
+| 2 | GET | `/bookmarks` (page) | List as Bob while Alice's row exists | `200`; Alice's label and `publicId` absent | Pass |
+| 3 | GET | `/bookmarks/[alice-publicId]` (page) | Edit the URL to Alice's identifier as Bob | `404`; nothing leaked | Pass |
 | 4 | GET | `/bookmarks/[alice-publicId]` (page) | Open Alice's detail URL with no session | `307` to `/signin` | Pass |
-| 5 | GET | `/bookmarks/[internal-id]` (page) | Use the raw database `id` where a `publicId` belongs, as the owner | `404` | Pass |
-| 6 | GET | `/api/bookmarks` | Call the list API with no session | `401` `Not authenticated` | Pass |
-| 7 | GET | `/api/bookmarks` | Call the list API as Bob | `200`, zero rows, no Alice data | Pass |
-| 8 | GET | `/api/bookmarks/[alice-publicId]` | Replay Bob's session against Alice's identifier | `404` `Bookmark not found` | Pass |
-| 9 | GET | `/api/bookmarks/[missing]` | Request a nonexistent identifier as Alice | `404`, byte-identical to row 8 | Pass |
-| 10 | GET | `/api/bookmarks/[internal-id]` | Use the raw database `id` on the API as the owner | `404` | Pass |
-| 11 | POST | `/api/bookmarks` | Create with no session | `401` `Not authenticated` | Pass |
-| 12 | POST | `/api/bookmarks` | Create as Bob without a CSRF token | `403` `Invalid CSRF token` | Pass |
-| 13 | POST | `/api/bookmarks` | Create as Bob with forged `userId` (Alice's), `publicId`, and `id` in the body | `201`; row owned by Bob, supplied `publicId` ignored, supplied `id` ignored, generated `publicId` returned | Pass |
-| 14 | POST | `/api/bookmarks` | Create a normal bookmark as Alice | `201`; response keys exactly `label`, `publicId`, `url` | Pass |
-| 15 | DELETE | `/api/bookmarks/[alice-publicId]` | Delete Alice's row as Bob with Bob's valid CSRF token | `404`; Alice's row still present afterward | Pass |
-| 16 | DELETE | `/api/bookmarks/[alice-publicId]` | Delete as Bob without a CSRF token | `403` `Invalid CSRF token` | Pass |
-| 17 | DELETE | `/api/bookmarks/[alice-publicId]` | Delete as Alice while sending Bob's CSRF token | `403` `Invalid CSRF token`; token is session-bound | Pass |
-| 18 | DELETE | `/api/bookmarks/[alice-publicId]` | Delete with no session and no CSRF token | `401` (session is checked before CSRF) | Pass |
-| 19 | DELETE | `/api/bookmarks/[alice-publicId]` | Delete Alice's own row with her valid CSRF token | `200`; exactly one audit row written | Pass |
+| 5 | GET | `/bookmarks/[internal-id]` (page) | Use the raw database `id` where a `publicId` belongs | `404` | Pass |
+| 6 | GET | `/api/bookmarks` | List API with no session | `401` | Pass |
+| 7 | GET | `/api/bookmarks` | List API as Bob | `200`, zero rows, no Alice data | Pass |
+| 8 | GET | `/api/bookmarks/[alice-publicId]` | Replay Bob's session against Alice's identifier | `404` | Pass |
+| 9 | GET | `/api/bookmarks/[missing]` | Request a nonexistent identifier | `404`, identical to row 8 | Pass |
+| 10 | GET | `/api/bookmarks/[internal-id]` | Raw database `id` on the API | `404` | Pass |
+| 11 | POST | `/api/bookmarks` | Create with no session | `401` | Pass |
+| 12 | POST | `/api/bookmarks` | Create as Bob without a CSRF token | `403` | Pass |
+| 13 | POST | `/api/bookmarks` | Create as Bob with forged `userId`, `publicId`, and `id` in the body | `201`; owned by Bob, forged fields ignored | Pass |
+| 14 | POST | `/api/bookmarks` | Normal create as Alice | `201`; response keys are exactly `label`, `publicId`, `url` | Pass |
+| 15 | DELETE | `/api/bookmarks/[alice-publicId]` | Delete Alice's row as Bob with a valid CSRF token | `404`; Alice's row still there | Pass |
+| 16 | DELETE | `/api/bookmarks/[alice-publicId]` | Delete as Bob without a CSRF token | `403` | Pass |
+| 17 | DELETE | `/api/bookmarks/[alice-publicId]` | Delete as Alice while sending Bob's CSRF token | `403`; the token is tied to the session | Pass |
+| 18 | DELETE | `/api/bookmarks/[alice-publicId]` | Delete with no session and no CSRF token | `401`; session is checked before CSRF | Pass |
+| 19 | DELETE | `/api/bookmarks/[alice-publicId]` | Alice deletes her own row with her valid token | `200`; exactly one audit row written | Pass |
 | 20 | DELETE | `/api/bookmarks/[alice-publicId]` | Repeat the same delete | `404`; no second audit row | Pass |
 | 21 | GET | `/api/bookmarks` | List as Alice after Bob's create | `200`; Alice's row present, Bob's absent | Pass |
 | 22 | GET | `/api/bookmarks` | List as Bob after Bob's create | `200`; Bob's row present, Alice's absent | Pass |
 | 23 | GET | `/api/bookmarks/[alice-publicId]` | Confirm Alice's row survived every Bob attempt | `200` before her own delete | Pass |
 | 24 | GET | `/api/bookmarks/[deleted]` | Fetch the row after Alice's own delete | `404` | Pass |
 
-Supporting checks: the API `404` body for "another user's row" and "missing row"
-compared byte-identical; the internal `Bookmark.id` did not appear in the
-rendered detail HTML; the `publicId` did; forged identifiers produced zero rows
-in the database.
+The 404 body for "another user's row" and for "missing row" was compared byte
+for byte and is identical. After every one of Bob's delete attempts I checked
+that Alice's bookmark was still there, because a delete attack only counts as
+stopped if the data survived.
 
----
+**What I chose against, and why.** The IDOR is the reason I did not rely on the
+random `publicId` as protection. The `publicId` is hard to guess, but it is not a
+secret, and an app that depends on an identifier staying hidden is one leak away
+from exposing everything. The ownership condition is the actual control.
 
-### 5.12 Evidence checklist
+### Why raw database identifiers are not exposed
 
-Every item is reproducible, and the database is returned to baseline after each
-run (`User=2, Session=0, RateLimitAttempt=0, Bookmark=0,
-BookmarkDeletionAudit=0`).
+**What it is.** `Bookmark.id` is the internal primary key. The browser never sees
+it. The only identifier a client ever receives is `publicId`, a separate random
+value.
 
-**Access-control table & attack log** - Detailed in Section 5.11, persisted in [`evidence/attack-table.md`](./evidence/attack-table.md) and [`evidence/access-control-evidence.md`](./evidence/access-control-evidence.md), with raw sequential execution output in [`evidence/attack-log.txt`](./evidence/attack-log.txt). Reproduce against a live server with:
+**Why it is needed.** An internal id is a stable handle into the database. It
+can reveal how many records exist or in what order they were made, it ties the
+public side of the app to the internal schema, and every leak of it is a leak of
+something that can never be changed. A separate public identifier can be replaced
+without touching the database design. I want to be honest that this is not what
+makes the app safe. It reduces what an outsider learns, while the scoped query
+does the real protecting.
 
-```bash
-npm run dev
-node scripts/run-attacks.mjs
-# or full test harness:
-node scripts/verify-bookmark-security.mjs
-```
+**How I implemented it.** Every read uses an explicit `select` with only
+`publicId`, `label`, and `url`, so the internal `id` and the owning `userId`
+cannot leak by accident through a broad query or a serialised object. I checked
+the rendered detail page and found the `publicId` in the HTML and the internal
+`id` nowhere in it. The create response contains exactly three keys. The
+screenshots in the Evidence section show the two identifiers side by side.
 
-26/26 assertions pass against both `next dev` and the production build
-(`npm run build`, then `npm run start`).
+**What I chose against, and why.** The simplest option was to use the primary
+key in URLs. I chose a second column because it keeps database identifiers off
+the public surface, even though it costs one extra unique index and one more
+value to reason about.
 
-**Query count table & measurement log** - Detailed in Section 5.10, persisted in [`evidence/query-count-table.md`](./evidence/query-count-table.md) with raw measurement logs in [`evidence/query-count-log.txt`](./evidence/query-count-log.txt). Reproduce on the live database with:
+### Audit logging
 
-```bash
-node scripts/measure-query-counts.mjs
-# or legacy harness:
-node scripts/measure-bookmark-queries.mjs
-```
+**What it is.** An audit log is a permanent record of an action that mattered:
+who did it, to what, and when. Here, every deletion writes a row to
+`BookmarkDeletionAudit` with the user, the `publicId`, a copy of the label, and
+the time.
 
-**Delete rollback paths** - reproduce with:
+**Why it is needed.** Once a row is deleted, the evidence that it ever existed is
+gone. Without an audit record, there is no answer to "who deleted this and when,"
+which matters for support questions and for noticing misuse. The record also has
+to be written at the right moment. If it is written after the delete, a crash
+between the two steps leaves a deleted bookmark with no trace.
 
-```bash
-node scripts/test-bookmark-delete-rollback.mjs
-```
+**How I implemented it.** The delete runs in one database transaction: a scoped
+lookup of the label, then the audit insert, then the scoped `deleteMany`. Because
+the audit is written first and inside the same transaction, it is impossible to
+have a delete without an audit row, or an audit row without a delete. I tested
+both failure paths with `scripts/test-bookmark-delete-rollback.mjs`, which passes
+3 of 3. When I forced the audit insert to fail, the bookmark stayed in place and
+no audit row appeared. When I simulated a second delete winning a race, the code
+returned `404` and no orphan audit row was left. The screenshots in the Evidence
+section show a deletion and the resulting audit row.
 
-3/3 pass: an audit-insert failure rolls back the whole transaction (bookmark
-still present, audit empty), a concurrent delete returns `null` with no orphan
-audit row, and the normal path writes exactly one audit row.
+**What I chose against, and why.** I did not write the audit row after the
+delete, which is the mistake the brief warns about. I also did not use a soft
+delete (a flag on the bookmark instead of removing it), because that would leave
+deleted rows in the table and force every query to filter them out, which is its
+own way of forgetting a condition.
 
-**Visual Evidence Screenshots** - Primary visual verification artifacts are organized in `evidence/` alongside headless browser captures in `docs/evidence/`:
+### Page architecture: conditional rendering with URL state
 
-- **Evidence 3a to 3c (`evidence/Evidence 3a.png`, `evidence/Evidence 3b.png`, `evidence/Evidence 3c.png`):** Evidence shots showing **audit-log-after-deletion**. Captures the deletion UI flow and verifies that an immutable audit row is written to `BookmarkDeletionAudit` with the user ID, public ID, label snapshot, and deletion timestamp.
-- **Evidence 4a (`evidence/Evidence 4a.png`):** Evidence shot showing **detail URL publicID**. Proves browser navigation to `/bookmarks/[publicId]` uses the non-sequential, random 12-character `publicId` (nanoid).
-- **Evidence 4b (`evidence/Evidence 4b.png`):** Evidence shot showing **bookmark Id vs public ID**. Contrasts internal database cuid (`Bookmark.id`) with public identifier (`Bookmark.publicId`), proving internal primary keys are never exposed to clients.
-- **Automated headless Chrome captures:** `scripts/capture-bookmark-evidence.mjs` generates `docs/evidence/detail-url.png` (detail page navigation with live URL banner) and `docs/evidence/audit-row.png` (database audit row after browser-driven deletion).
+**What it is.** The list and the detail view are different views of the same app,
+and moving between them should feel fast, without reloading the whole page. But
+each view should also have its own real URL, so it can be bookmarked, shared, or
+reloaded and still land on the same thing.
 
-Each run generates fresh identifiers and deletes its rows and session
-afterward. The screenshots prove the behavior, not the specific `publicId`
-strings in them; the harness output and the SQL below show values from a live
-run.
+**Why it is needed.** Both properties matter, for different reasons. Fast
+navigation makes the app pleasant. A real URL makes every view addressable. If
+the URL never changes while views swap, nothing can be shared and reloading drops
+you back at the start. If every click reloads the whole page, the app feels slow.
 
-Values captured from the Phase 8 run, before cleanup:
+**How I implemented it.** The list lives at `/bookmarks` and each bookmark lives
+at `/bookmarks/[publicId]`. Both are server components. They check the session
+and `redirect("/signin")` before any data is touched, and the detail page calls
+`notFound()` when the scoped lookup returns nothing. The pages link to each other
+with the Next.js `Link` component, so moving between them is a client-side
+transition and not a full reload, while the address bar still updates. Because
+the page and the API both use `getBookmark`, the page cannot end up with a
+different ownership rule from the API.
 
-```
-audit.id               = cmvjk4db000099ctz8allzgb0
-audit.userId           = cmvi771tc0000kktzhaqk7m2s  (alice@test.bookmark)
-audit.bookmarkPublicId = NveOfuwXbvOy                (the deleted bookmark)
-audit.bookmarkLabel    = "Phase8 Alice Secret"
-audit.deletedAt        = 2026-10-22T12:08:36.060Z
+**What I chose against, and why.** I did not build a single page that swaps views
+using only client state, because the URL would never change and nothing could be
+shared. I also did not use plain anchor tags that reload the whole page, because
+that gives up the fast navigation the brief asks for.
 
-detail URL             = http://localhost:3100/bookmarks/NveOfuwXbvOy
-publicId               = NveOfuwXbvOy
-internal Bookmark.id   = cmvjk46u100079ctz97e1x0h4
-internal id in HTML    = false
-publicId in HTML       = true
-```
+### Status codes (401 versus 403, and why a miss is a 404)
 
----
+**What it is.** The status code tells the caller what kind of failure happened.
+`401` means "I do not know who you are." `403` means "I know who you are, and I
+am refusing this request." `404` means "there is nothing here for you."
 
-### 5.13 Notable decisions and the one documented deviation
+**Why it is needed.** A wrong code can leak information. The most important case
+is a request for another user's bookmark. If the app answered `403` there, it
+would be telling the caller "that identifier exists, it is just not yours." That
+lets an attacker work through identifiers and learn which ones are real. Answering
+`404` for both "does not exist" and "belongs to someone else" gives them nothing.
 
-- The two bookmark migrations were added as new, forward-only migrations
-  (`add_bookmarks`, `reconcile_auth_schema`) rather than rewriting the existing
-  init migration. The init migration stays untouched.
-- `Bookmark.userId` is always taken from the session. The Zod schema strips
-  unknown keys, so body-supplied ownership fields are ignored.
-- The delete transaction audits before deleting and rolls back if the audit or
-  the delete cannot complete. A concurrent disappearance returns `404` without
-  leaving an orphan audit row.
-- **Deviation:** PRD Section 10's delete target of 2 -> 1 is not reachable while
-  keeping the Section 7 audit guarantee. The shipped path is 4 -> 3, and the
-  2 -> 1 figure is shown as an explicitly labeled no-audit variant. The audit
-  and scoping guarantees were not weakened to match the target.
-- Query-count baselines use redundant but still fully scoped queries, so the
-  measurement harness never demonstrates an insecure pattern.
-- `npm run lint`, `build`, `dev`, and `start` call the local binaries through
-  `node` directly, which keeps them working when the project path contains
-  `&`. The ESLint config exempts CommonJS utility scripts from
-  `no-require-imports`. The two pre-existing warnings in
-  `src/lib/validation.ts` are in the protected auth slice and were left
-  untouched.
+**How I implemented it.** The check order is the same for every bookmark route:
+session, then CSRF, then validation, then the data.
 
----
-
-## 6. Route Simplification, Rebranding, and Environment Resilience
-
-Following the completion of the Records and Access slice, the application was refined to eliminate leftover artifact routes from the ported authentication template, establish direct navigation to the primary slice (`/bookmarks`), rebrand user-facing visual identity and accessibility tokens, and resolve Windows path handling for local tooling.
-
-### 6.1 Route simplification and `/dashboard` deprecation
-
-- **Direct landing on `/bookmarks`:** Post-sign-in navigation (`src/app/(auth)/signin/page.tsx`) and already-authenticated route guards (`src/app/(auth)/layout.tsx`) were updated to direct authenticated users immediately to `/bookmarks` instead of the legacy `/dashboard`.
-- **`/dashboard` redirect:** The `/dashboard` route (`src/app/dashboard/page.tsx`) was repurposed into a server-side redirect to `/bookmarks` using Next.js `redirect("/bookmarks")`. This preserves compatibility with existing bookmarks and URL history while removing the redundant screen. The temporary button component was removed.
-- **Header greeting:** At the top of `/bookmarks` (`src/app/bookmarks/page.tsx`), the previous "Back to dashboard" button was removed and replaced with a clean user greeting heading: `Welcome back, {user's name}`. No extraneous counters, statistics, or panels were introduced.
-- **Route protection in proxy:** `src/proxy.ts` was updated so `PROTECTED_ROUTES = ["/bookmarks", "/dashboard"]`. Unauthenticated visits to `/bookmarks` and `/dashboard` are intercepted at the edge/middleware layer with a `307` redirect to `/signin`.
-
-### 6.2 Visual identity and rebranding
-
-- **Application metadata:** Page title updated from `"Auth Assessment"` to `"Bookmarks"`, and description set to `"A private, secure bookmarks application."` in `src/app/layout.tsx`. Manifest metadata in `package.json` (`"name": "bookmarks"`) and `README.md` (`# Bookmarks`) were brought into parity.
-- **Logo component:** An inline SVG component (`src/components/logo.tsx`) was created, rendering a clean line sketch of an open book with a hanging ribbon bookmark (`fill="none"`, `stroke="currentColor"`). It is rendered beside the `"Bookmarks"` wordmark in the application header (`DashboardHeader`) and on the sign-in card.
-- **Favicon modernization:** Added `src/app/icon.svg` using the Next.js App Router icon convention (`width="32"`, `height="32"`, stroke-width `2.2` in brand amber `#F49F04` with a transparent background). The legacy default `src/app/favicon.ico` was removed, allowing browsers to render the scalable SVG icon directly.
-
-### 6.3 Color system and accessible contrast
-
-- **Primary amber palette:** The application primary color was updated to amber `#F49F04` in `:root` inside `src/app/globals.css`.
-- **WCAG contrast compliance:**
-  - *Amber button backgrounds:* White text on `#F49F04` provides poor contrast (~1.8:1). A dedicated `--color-primary-text: #1f2937` token was introduced and applied to `.btn-primary` alongside `font-weight: 600`, achieving high-contrast dark text (>8:1 contrast ratio, AAA compliance).
-  - *Text on white/light backgrounds:* Pure amber text on `#ffffff` fails WCAG AA legibility. A dedicated darker token `--color-primary-dark: #9A5B02` (hover: `--color-primary-dark-hover: #7C4801`) was added and mapped to `.dashboard-header__brand`, `.auth-brand`, `.btn-link`, and `.detailUrl`, achieving a 4.7:1 contrast ratio against `#ffffff`.
-
-### 6.4 Windows CLI path resilience (`fix-cmd-shims`)
-
-- **Root cause:** Running in paths with ampersands (e.g. `Record & Access`) causes Windows `cmd.exe` to interpret `&` in npm's default `.bin/*.cmd` shims (`SET dp0=%~dp0`) as a command separator, truncating `%dp0%` and breaking CLI tools like `npx prisma studio`.
-- **Automated resolution:** Added `scripts/fix-cmd-shims.js`, wired into `"postinstall": "node scripts/fix-cmd-shims.js"` in `package.json`, which automatically wraps the `dp0` assignment in quotes (`SET "dp0=%~dp0"`) across all `.cmd` files in `node_modules/.bin`.
-- Added shortcut script `"db:studio": "prisma studio"` to `package.json`.
-
----
-
-## 7. Evidence Pack & Live Verification Artifacts
-
-The application repository contains an audited evidence pack under [`evidence/`](./evidence/) capturing live security enforcement, query count optimization, and visual UI/database verification.
-
-### 7.1 Access Control Attack Evidence (`evidence/attack-table.md`, `evidence/attack-log.txt`)
-
-A complete 13-row access control attack suite was executed against the live application (`http://localhost:3000`) using real test accounts (`alice@test.bookmark` and `bob@test.bookmark`). All raw terminal outputs are recorded sequentially in [`evidence/attack-log.txt`](./evidence/attack-log.txt), and summarized in [`evidence/attack-table.md`](./evidence/attack-table.md) and [`evidence/access-control-evidence.md`](./evidence/access-control-evidence.md).
-
-Key security contracts proven by the attack log:
-1. **Authentication Enforcement (401 Unauthorized):** Requests to `/api/bookmarks` or `/api/bookmarks/[publicId]` without a valid session cookie return `401 Unauthorized`. Unauthenticated visits to page routes (`/bookmarks`, `/bookmarks/[publicId]`) return a `307` redirect to `/signin`.
-2. **CSRF Protection on Mutating Endpoints (403 Forbidden):** Mutating endpoints (`POST`, `DELETE`) require a double-submit CSRF token matching the session. Requests with missing or forged tokens are refused with `403 Forbidden` prior to data lookup.
-3. **Anti-Enumeration Uniform 404s:** When Bob attempts to fetch Alice's bookmark (`GET /api/bookmarks/4QNxK5vfsj4K`) vs. a non-existent ID (`GET /api/bookmarks/nonexistent99`), both return `404 Not Found` with byte-identical 50-byte response bodies (`{"success":false,"message":"Bookmark not found"}`), denying attackers an ID-enumeration oracle.
-4. **Server-Side Ownership Enforcement (Row 11):** When Bob posts a bookmark with a forged `"userId"` set to Alice's ID (`cmvi771tc0000kktzhaqk7m2s`), Zod schema validation strips the field, and the server binds ownership strictly to Bob's session ID (`cmvi772dd0000nwtzavrrd76g`), proven by direct database query.
-5. **Data Survival on Unauthorized Delete:** After unauthorized delete attempts by Bob (with or without CSRF token), Alice's bookmark was verified to survive intact.
-
-### 7.2 Query Count Evidence & Optimization (`evidence/query-count-table.md`, `evidence/query-count-log.txt`)
-
-Query counts were measured against live PostgreSQL using Prisma's event emitter (`db.$on("query")`) in [`scripts/measure-query-counts.mjs`](./scripts/measure-query-counts.mjs) across 3-run repetitions, documented in [`evidence/query-count-table.md`](./evidence/query-count-table.md) with raw output in [`evidence/query-count-log.txt`](./evidence/query-count-log.txt).
-
-Key findings:
-- **List ($2 \to 1$):** Removed redundant `COUNT(*)` query for empty checks; empty state is determined by array length. Measured across 0 rows, 1 row, and 20 rows, the query count is strictly constant ($O(1)$ scaling), proving **zero N+1 query vulnerability**.
-- **View Detail ($3 \to 1$):** Consolidated redundant existence check, ownership check, and data retrieval into a single user-scoped `findFirst`, representing the single largest reduction (66.7% drop, saving 2 round-trips).
-- **Delete ($4 \to 3$ data queries, $6 \to 5$ total statements including `BEGIN` and `COMMIT`):** Consolidated pre-existence lookup with label lookup inside an atomic transaction. Preserves the mandatory `BookmarkDeletionAudit` insert before deletion. Explains why the PRD Section 10 hypothetical target ($2 \to 1$) applies only if audit logging is omitted.
-- **Session Validation Overhead:** Evaluated separately at **3 data queries** in Prisma Client (`Session` lookup, `User` relation lookup, `Session.lastActivityAt` update), disclosed alongside domain metrics as shared authentication infrastructure.
-
-### 7.3 Visual Evidence Screenshots
-
-Visual proof of key security, audit, and data isolation requirements is captured in `evidence/`:
-
-| Evidence File | Artifact Category | Description & Verification Proof |
+| Status | When | Why not the alternative |
 |---|---|---|
-| [`evidence/Evidence 3a.png`](./evidence/Evidence%203a.png)<br>[`evidence/Evidence 3b.png`](./evidence/Evidence%203b.png)<br>[`evidence/Evidence 3c.png`](./evidence/Evidence%203c.png) | **Audit log after deletion** | Demonstrates the complete bookmark deletion sequence and database verification. Proves that deleting a bookmark writes an immutable audit entry to `BookmarkDeletionAudit` capturing `userId`, `bookmarkPublicId`, `bookmarkLabel`, and `deletedAt`. |
-| [`evidence/Evidence 4a.png`](./evidence/Evidence%204a.png) | **Detail URL publicID** | Demonstrates detail page navigation (`/bookmarks/[publicId]`). Shows the browser address bar and URL structure containing the unguessable 12-character random nanoid (`publicId`), with no internal IDs exposed. |
-| [`evidence/Evidence 4b.png`](./evidence/Evidence%204b.png) | **Bookmark Id vs. Public ID** | Demonstrates internal identity isolation. Directly contrasts the internal database primary key (`Bookmark.id`, cuid) against the client-facing public identifier (`Bookmark.publicId`), confirming internal IDs are never exposed in the URL, HTML responses, or API payloads. |
+| `401` | No valid session, on any bookmark page or API route | Failing to authenticate is its own condition. Hiding it behind a `404` would confuse legitimate clients without protecting anything. |
+| `403` | Valid session, but a `POST` or `DELETE` with a missing or wrong CSRF token | This is not an ownership answer. It is decided before any row is looked up, so it reveals nothing about the identifier. |
+| `404` | The scoped query returned no row, because the bookmark is missing or belongs to someone else | A `403` here would confirm the identifier exists. A uniform `404`, with an identical body, removes that signal. |
+| `400` | Malformed JSON or a label or URL that fails validation | A client error, not an authorisation decision, so it is checked only after identity and CSRF. |
+| `307` | An unauthenticated visit to a bookmark page | Pages redirect to sign in. APIs return `401`. |
 
+The tests confirm the order. A delete with no session and no token returns `401`,
+not `403`. Bob's delete with a valid session and no token returns `403`, not
+`404`. Bob's delete with a valid token returns `404`. A request from Alice that
+carries Bob's CSRF token also returns `403`, which shows the token is checked
+against the session and not just present.
+
+**What I chose against, and why.** I did not return `403` for ownership failures,
+because of the enumeration problem above. The downside is that a real "this is
+not yours" message is not possible, and debugging gets slightly harder because
+the logs cannot tell a missing bookmark from someone else's. I accepted that,
+since the ambiguity is the point. I kept `403` for a different, honest meaning:
+the CSRF refusal.
+
+### Database indexing
+
+**What it is.** An index is an extra structure the database keeps so it can find
+rows without reading the whole table, like the index at the back of a book. The
+cost is a little extra storage and a little extra work on every write.
+
+**Why it is needed.** Every query here filters by `userId` first. Without an
+index on it, each list or lookup would scan the entire `Bookmark` table, and the
+cost would grow with every user's data, not just the current user's.
+
+**How I implemented it.** I checked each index against the live database with
+`prisma migrate diff` and `pg_indexes`.
+
+| Index | Why it exists |
+|---|---|
+| `Bookmark_publicId_key` (unique) | Detail and delete lookups by `publicId`, and it guarantees the identifier is unique. |
+| `Bookmark_userId_idx` | Every list, lookup, and delete filters by the session's `userId`. |
+| `Bookmark_userId_createdAt_idx` | The list is `WHERE userId = ? ORDER BY createdAt DESC`. This one index serves both the filter and the sort. |
+| `BookmarkDeletionAudit_userId_idx` | Supports looking up a user's audit history. |
+
+**What I chose against, and why.** I did not add an index on label or URL,
+because this slice has no search. Adding one should follow a real query that
+needs it, not be done speculatively.
+
+### Query count as a cost
+
+**What it is.** Every database query is a round trip, and round trips add latency
+and load. Counting them for each action shows where the app is doing redundant
+work.
+
+**Why it is needed.** Extra queries are easy to add without noticing, especially
+when ownership, existence, and fetching are each done as a separate step. Each one
+costs time on every request and adds up as the app grows.
+
+**How I implemented it.** I measured the three main actions against the live
+PostgreSQL database by listening to Prisma's query events
+(`scripts/measure-query-counts.mjs`), repeating each measurement three times.
+Counts are data queries (`SELECT`, `INSERT`, `UPDATE`, `DELETE`), and transaction
+control statements are excluded. The "before" versions are deliberately redundant
+baselines I wrote for measurement. They are still scoped to the user in every
+query, so the measurement never uses an unsafe pattern.
+
+| Action | Before | After | What changed |
+|---|---|---|---|
+| List | 2 | 1 | Removed a separate `COUNT` used only for the empty state. The page checks the length of the single result instead. |
+| View detail | 3 | 1 | Existence, ownership, and the row data are answered by one scoped `findFirst`. The two extra lookups are gone. |
+| Delete (with audit, as shipped) | 4 | 3 | Removed a redundant second ownership lookup. What remains is one scoped label lookup, the audit insert, and one scoped `deleteMany`. |
+| Delete (no audit, for comparison) | 2 | 1 | A single scoped `deleteMany` replaces lookup then delete. Not shipped, because it would drop the audit. |
+
+For the shipped code, list is one scoped `SELECT` ordered by `createdAt`, detail
+is one scoped `SELECT` by `publicId` and `userId`, and delete is a scoped
+`SELECT` of the label, an `INSERT` into the audit table, and a scoped `DELETE`.
+The list query count stayed at one when I measured it with 0, 1, and 20 rows, so
+there is no N+1 problem.
+
+**The single change that cut the most queries** was combining existence,
+ownership, and fetch for the detail view, which went from 3 queries to 1. It
+saved the most because all three questions are answered by the same `WHERE`
+clause, so the extra queries were pure repetition.
+
+**A deviation from my plan.** I planned for delete to drop from 2 queries to 1.
+That is only possible without the audit write. With the audit required before the
+delete, three statements is the honest minimum, so the real result is 4 down to
+3. I kept the audit guarantee and did not shave the number to match my plan. The
+2 to 1 figure is shown above as a separate variant for comparison.
+
+**What these counts leave out.** Every authenticated request also pays for
+session validation: a session lookup, a user lookup, and an update to
+`lastActivityAt`. That is shared authentication cost, not bookmark work, so I left
+it out of the table and am noting it here so the numbers are not mistaken for the
+full cost of a request.
+
+**What I chose against, and why.** I did not measure only the optimised code. A
+before and after needs a real baseline, and writing one that is redundant but
+still safe was a better choice than comparing against code that did not exist.
+
+### The single change that would have prevented the most audit failures
+
+The most valuable decision in this slice was making `userId` a required first
+argument of every function in `src/lib/bookmarks.ts`, and keeping all bookmark
+database access inside that one module. Nearly every access-control failure in
+this kind of app comes from one place: a query that forgot the owner condition.
+With this design, a function cannot be called without an owner, no route calls
+Prisma for bookmarks on its own, and there is one file to audit. If I had built
+the routes first and added ownership checks to each afterward, the way many apps
+grow, that single mistake would have shown up in the attack table.
+
+---
+
+## Section 6: What Went Wrong
+
+### 1. The ported auth brought in far more than I asked for
+
+**Symptom.** After I copied the sign in system into this project, the folder
+tree was full of things I did not want: `forgot-password`, `resend-code`,
+`reset-password`, `signup`, `verify-email`, and `verify-reset-code` routes, matching
+pages under `(auth)`, `email.ts` and `reset-code.ts` in `src/lib`, an OTP input
+component, and a `User` model with `emailVerified` and links to verification code
+and password reset token tables.
+
+**Investigation.** I looked through the explorer and the schema and compared them
+against the three things I actually needed: sign in, session checking, and the
+user table. Almost everything else was dead weight.
+
+**Cause.** The copy had brought over the whole auth system instead of only the
+parts I named. It did not match what this slice needs.
+
+**Fix.** I removed the extra routes and pages, deleted the email and reset code
+files and the OTP component, trimmed the `User` model, and searched the codebase
+for leftover imports and references. I recorded the schema change in a new
+forward-only migration (`reconcile_auth_schema`) instead of rewriting the existing
+one, then confirmed sign in and the route protection still worked.
+
+### 2. The project folder name broke the Prisma tooling on Windows
+
+**Symptom.** `npx prisma studio` would not start. The project lives in a folder
+called `Record & Access`.
+
+**Investigation.** I traced the failure to the command shims that npm creates
+under `node_modules/.bin`. Each one is a small `.cmd` file for Windows.
+
+**Cause.** `cmd.exe` treats an ampersand as the start of a new command. The shims
+set a variable from the folder path, so the path was cut off at the `&` and the
+tools could not find their own files.
+
+**Fix.** I added `scripts/fix-cmd-shims.js`, run automatically through
+`postinstall`, which wraps that assignment in quotes in every shim. I also made
+the `lint`, `build`, `dev`, and `start` scripts call the local binaries through
+`node` directly, and added a `db:studio` script. Renaming the folder would have
+been the quickest fix, but this also works for anyone who clones into a path with
+an ampersand.
+
+### 3. My query count prediction was wrong for delete
+
+**Symptom.** When I measured delete, the count was 4 down to 3. My plan had said
+2 down to 1.
+
+**Investigation.** I listed every statement the delete runs, in order, and
+compared it to the plan.
+
+**Cause.** The plan counted only "check ownership, then delete." It left out the
+audit write that the same plan required before every deletion. A delete that is
+audited has to read the label, insert the audit row, and delete the bookmark.
+
+**Fix.** There was nothing to fix in the code. The mistake was in the target. I
+kept the audit guarantee, reported the real numbers, and showed the 2 to 1 figure
+only as a clearly labelled variant without the audit, so the table stays honest.
+
+### 4. A leftover secret that did nothing
+
+**Symptom.** `.env.example` still listed a `SESSION_SECRET`, with a comment about
+signing session data, even though this project never used one.
+
+**Investigation.** I asked how sessions are created and validated, and traced it
+in `src/lib/session.ts`.
+
+**Cause.** The variable was left over from the template the auth system came from.
+Sessions here are random tokens whose SHA-256 hash is stored in the database, and
+validity is decided by a database lookup, not by checking a signature, so no
+signing secret is needed. A fast hash like SHA-256 is fine for this, because a
+session token is long and random, unlike a password.
+
+**Fix.** I removed `SESSION_SECRET` and its comment. I kept `CSRF_SECRET`, since
+the CSRF tokens do use it.
+
+---
+
+## Section 7: What This Slice Does Not Handle
+
+**Left out because it was outside the brief:**
+
+- Editing, search, tags, sharing, and collaboration, which the brief said not to
+  build.
+- Sign up, email verification, and password reset. Test users are created by a
+  script.
+- Auditing anything other than deletions. Logging reads or updates would multiply
+  the write volume and the brief only asked for deletions.
+
+**Left out because I did not get to it:**
+
+- **Pagination.** The list returns every bookmark a user has. I tested up to 20
+  rows. A user with thousands of bookmarks would get one very large response, and
+  this is the first thing I would fix before real users touched it.
+- **Rate limiting on creating bookmarks.** The ported rate limiter exists but is
+  not applied to the bookmark routes, so someone signed in could create bookmarks
+  in a loop.
+- **A shared end to end test suite.** I have scripts that reproduce the attacks
+  and the query counts, but they are not part of an automated test run.
+
+**Things I know about and would need to change before real use:**
+
+- **The protection lives only in application code.** The database would return
+  someone else's bookmark to any query that forgot the `userId` condition. Moving
+  the rule into the database with row level security, or at least keeping the
+  single data-access module strictly enforced in code review, would be the next
+  step.
+- **The audit log is not tamper-proof.** It is an ordinary table, so nothing in the
+  database stops its rows from being edited or deleted, and a compromised
+  application could write false rows.
+- **Deleting a user also deletes their audit history**, because the audit rows
+  cascade with the user. For a real product I would keep the audit rows after an
+  account is deleted.
+- **The 404 makes debugging harder.** Logs cannot tell "missing" from "not yours."
+  That is deliberate, but it would need extra, careful logging to help support.
+
+---
+
+## Section 8: If I Built This Again
+
+If I built this again, the one thing I would change is how I bring in the sign in
+code. I copied a whole authentication system and then spent a cleanup pass
+removing sign up, email verification, password reset, and a trimmed-down schema,
+and the same kind of over-copying slowed me down on an earlier project too. Next
+time I would start from an empty project and copy in only the three pieces I
+actually need, the user table, the sign in route, and the session check, one file
+at a time. The access control itself went well because I designed it around one
+rule from the start, but the setup lost time on code I never wanted.
+
+---
+
+## Evidence
+
+Screenshots and logs referenced above are in the `evidence/` folder at the root of
+this repository.
+
+**Audit log after a deletion.** Deleting a bookmark through the app, then the new
+row in `BookmarkDeletionAudit` with the user, the `publicId`, the label, and the
+timestamp.
+
+![Audit log evidence, part 1](./evidence/Evidence%203a.png)
+![Audit log evidence, part 2](./evidence/Evidence%203b.png)
+![Audit log evidence, part 3](./evidence/Evidence%203c.png)
+
+**A URL with an identifier that is not the database id.** The detail page URL
+contains the random 12 character `publicId`.
+
+![Detail page URL showing the publicId](./evidence/Evidence%204a.png)
+
+**The two identifiers compared.** The internal `Bookmark.id` next to the public
+`Bookmark.publicId` for the same row.
+
+![Bookmark id compared with publicId](./evidence/Evidence%204b.png)
+
+**Other evidence files:**
+
+- `evidence/attack-table.md` and `evidence/attack-log.txt`: the live access
+  control attacks, with the exact curl commands and the raw output.
+- `evidence/query-count-table.md` and `evidence/query-count-log.txt`: the query
+  count measurements and the raw log.
